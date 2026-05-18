@@ -20,10 +20,10 @@ NOTES (2026-05-18):
 Setup:
 ---------------------
 Create vqvae python virtual environment
-1) python3 -m venv vq_vae
+1) python3 -m venv vq_vae <br/>
 
-Activate env
-2) In notebooks, select created virtual environment
+Activate env <br/>
+2) In notebooks, select created virtual environment <br/>
 
-Install packages
-3) uv pip3 install -r --no-cache-dir requirements.txt
+Install packages <br/>
+3) uv pip3 install -r --no-cache-dir requirements.txt <br/>
