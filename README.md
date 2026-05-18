@@ -16,3 +16,14 @@ NOTES (2026-05-18):
 -------------------
 * notebooks/mvp_vq.ipynb - recent VQ-VAE experiment notebook with marginally perspective results
 * notebooks/mvp.ipynb - recent VAE experiment notebook with marginally perspective results
+
+Setup:
+---------------------
+Create vqvae python virtual environment
+1) python3 -m venv vq_vae
+
+Activate env
+2) In notebooks, select created virtual environment
+
+Install packages
+3) uv pip3 install -r --no-cache-dir requirements.txt
