@@ -11,6 +11,7 @@ File structure:
 * bin - built models that are ready for testing in software
 * examples - old experiment example code
 * results - folder containing experiment plots and analytical reports
+* helpers - folder that contains all the required helper classes and functions
 
 NOTES (2026-05-18):
 -------------------
