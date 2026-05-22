@@ -1,11 +1,38 @@
 from pileup_ml.pixels.patches import event_hits_to_patches
 from pileup_ml.pixels.hits import PixelDigiEvent
 from matplotlib.gridspec import GridSpec
+from collections import OrderedDict
+from random import shuffle
 from torch.nn import Module
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+class DatasetOutput(OrderedDict):
+    """Base DatasetOutput class fixing the output type from the dataset. This class is inspired from
+    the ``ModelOutput`` class from hugginface transformers library"""
+
+    def __getitem__(self, k):
+        if isinstance(k, str):
+            self_dict = {k: v for (k, v) in self.items()}
+            return self_dict[k]
+        else:
+            return self.to_tuple()[k]
+
+    def __setattr__(self, name, value):
+        super().__setitem__(name, value)
+        super().__setattr__(name, value)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        super().__setattr__(key, value)
+
+    def to_tuple(self) -> tuple:
+        """
+        Convert self to a tuple containing all the attributes/keys that are not ``None``.
+        """
+        return tuple(self[k] for k in self.keys())
+    
 
 class CMSDataTool:
     
@@ -25,7 +52,7 @@ class CMSDataTool:
             patch_size,
             module_rows=160,
             module_cols=416
-        ):
+        ) -> int:
     
         (
             width, 
@@ -161,7 +188,18 @@ class CMSPlots:
         plt.tight_layout()
         plt.show()
         
-    def plot_patches(self, patch_rows: list[tuple], title: str) -> None:
+    def plot_patches(
+        self, 
+        patch_rows: list[tuple], 
+        title: str, 
+        include_codebook: bool=False,
+        include_embeddings: bool=False,
+        embeddings: int = 0
+    ) -> None:
+        
+        if len(patch_rows) > 3:
+            raise Exception("Only three rows allowed!")
+        
         cols = len(patch_rows[0][0])
         rows = len(patch_rows)
 
@@ -208,34 +246,54 @@ class CMSPlots:
                 ax = fig.add_subplot(gs[i, j])
 
                 patch = patch_row[j]
-
-                # Keep your current row-1 transpose logic
+                
+                
                 if i == 1:
-                    patch = patch.T
+                    if include_codebook:
+                        patch = patch.T
 
-                    im = ax.imshow(
-                        patch,
-                        cmap="coolwarm",
-                        origin="lower",
-                        aspect="auto",
-                        interpolation="nearest",
-                        vmin=-global_abs_max,
-                        vmax=global_abs_max
-                    )
+                        im = ax.imshow(
+                            patch,
+                            cmap="coolwarm",
+                            origin="lower",
+                            aspect="auto",
+                            interpolation="nearest",
+                            vmin=-global_abs_max,
+                            vmax=global_abs_max
+                        )
 
-                    ax.set_box_aspect(1.5)
+                        ax.set_box_aspect(1.5)
+                        continue
+                    
+                    if include_embeddings:
+                        if not embeddings:
+                            raise Exception("embeddings can not be zero") 
+                        
+                        cmap = plt.get_cmap("tab20", embeddings)
+                        im = ax.imshow(
+                            patch,
+                            cmap=cmap,
+                            origin="lower",
+                            aspect="auto",
+                            interpolation="nearest",
+                            vmin=-global_abs_max,
+                            vmax=global_abs_max
+                        )
+
+                        ax.set_box_aspect(1.5)
+                        continue
 
 
-                else:
-                    im = ax.imshow(
-                        patch,
-                        cmap="gist_yarg",
-                        origin="lower",
-                        aspect="equal"
-                    )
+                # else:
+                im = ax.imshow(
+                    patch,
+                    cmap="gist_yarg",
+                    origin="lower",
+                    aspect="equal"
+                )
 
-                    # Square input/output patches
-                    ax.set_box_aspect(1.0)
+                # Square input/output patches
+                ax.set_box_aspect(1.0)
 
                 ax.set_xticks([])
                 ax.set_yticks([])
@@ -248,16 +306,36 @@ class CMSPlots:
 
         
 class PixelPatchesDataset(torch.utils.data.Dataset):
-    def __init__(self, event: PixelDigiEvent, patch_size, transform=None):
-        event_patches_adcs_flat = event_hits_to_patches(
+    def __init__(
+        self, 
+        event: PixelDigiEvent, 
+        patch_size: int, 
+        transform=None, 
+        val: bool = False, 
+        val_size: int = 15,
+        shuffle_val: bool = False,
+        formatted: bool = False
+    ):
+        event_patches_adcs = event_hits_to_patches(
             event, 
             patch_size=patch_size
         ).as_array()
+        
+        if val:
+            event_patches_adcs = event_patches_adcs[:val_size]
+        
+        self.val = val
+        self.formatted = formatted
+        
         self.event_patches_adcs = [
             event_patch_flat.reshape(patch_size, patch_size)
-            for event_patch_flat in event_patches_adcs_flat
+            for event_patch_flat in event_patches_adcs
             if not (np.all(event_patch_flat == 0))
         ]
+        
+        if shuffle_val:
+            shuffle(self.event_patches_adcs)
+        
         
         self.transform = transform
 
@@ -274,7 +352,16 @@ class PixelPatchesDataset(torch.utils.data.Dataset):
         if self.transform:
             event_patch = self.transform(event_patch)
         
-        return event_patch
+        # TODO: uncomment if second baseline experiment is not good
+        # return event_patch
+        
+        # TODO: If second baseline is good, move line in a separate
+        # helper class
+        
+        if self.val or not self.formatted:
+            return event_patch
+            
+        return DatasetOutput(data=event_patch, label=0)
         
     
     
