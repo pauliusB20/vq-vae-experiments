@@ -1,19 +1,20 @@
 # TODO: fix issue regarding relative imports
 
-from ...helpers.models import ModelConfig
 from torch.utils.data import DataLoader
-from ..ml_models.vq_vae import VQVAE
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from datetime import datetime
 import torch.optim as optim
 from tqdm import tqdm
-import torch, os
+import torch, os, sys
 from torchmetrics.regression import MeanSquaredError
 from helpers.model_tool import ModelTool
 from helpers.data_tool import CMSDataTool, \
-                                CMSPlots, \
-                                PixelPatchesDataset
+                                CMSPlots
+
+
+from helpers.models import ModelConfig
+from components.vqvae_model.networks import VQVAE
 
 # Goal for the VQVAE postprocessing 
 # is to create helper classes that could 
@@ -35,9 +36,13 @@ class CMSVQVAE:
         self.config = config
         
         self.vq = VQVAE(
+            channels=self.config.channels,
             hidden_channels=self.config.hidden_channels, 
             kernel_size = self.config.kernel_size,
             slope=self.config.slope,
+            num_embeddings=self.config.num_embeddings,
+            latent_dim=self.config.latent_dim,
+            beta=self.config.beta,
             n_res_layers=self.config.residual_layers, # residual hidden layers
             res_h_dim=self.config.residual_channels # residual hidden channels
         ).to(self.config.device)
@@ -54,7 +59,7 @@ class CMSVQVAE:
         
         self.plots = CMSPlots()
         self.model_tool = ModelTool()
-        self.mse = MeanSquaredError()
+        self.mse = MeanSquaredError().to(config.device)
         
         # create helper folders
         if not os.path.exists(config.model_folder):
@@ -64,7 +69,7 @@ class CMSVQVAE:
     # TODO: Add data loaders and continue wwriting training 
     # loop code
     
-    def fit(self) -> None:
+    def fit(self, verbose: bool = False) -> None:
        start_time = datetime.now() 
        
        for epoch in range(self.config.num_epochs):
@@ -102,10 +107,17 @@ class CMSVQVAE:
                 
                 self.optimizer.step()
             
+            
             avg_loss_value = train_loss / len(self.train_loader)
             avg_mse_value = train_mse_loss / len(self.train_loader)
             self.avg_loss_train.append(avg_loss_value)
             self.avg_mse_loss_train.append(avg_mse_value)
+            
+            if verbose:
+                print(
+                    f"Epoch ({epoch}/{self.config.num_epochs})"
+                    f" model VQ_LOSS + BCE Loss = {avg_loss_value}"
+                )
        
        self.total_execution = (datetime.now() - start_time).seconds 
        print(f"Training completed with runtime: {self.total_execution} seconds")
@@ -114,6 +126,7 @@ class CMSVQVAE:
        
        
     def _get_vae_loss(
+        self,
         recon_x: torch.tensor, 
         x: torch.tensor
     ) -> float:
@@ -154,9 +167,9 @@ class CMSVQVAE:
         print(f"SUCCESS: Model saved in {self.config.model_source_path}")
     
     
-    def transform(self, x: torch.tensor) -> tuple|None:
+    def transform(self, patch: torch.tensor) -> tuple|None:
         with torch.no_grad():
-            output = self.vq.encoder(x)
+            output = self.vq.encoder(patch)
             (
                 recon_loss, 
                 z_q, 

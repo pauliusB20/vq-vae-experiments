@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from torch import device
 import numpy as np
 import os
 
@@ -19,9 +20,12 @@ class ModelConfig:
     channels: int
     hidden_channels: int
     num_embeddings: int
+    kernel_size: int
+    slope: np.float64
     latent_dim: int
     residual_channels: int
     residual_layers: int
+    device: device
     
     @property
     def model_source_path(self) -> str:

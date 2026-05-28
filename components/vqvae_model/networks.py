@@ -1,5 +1,6 @@
 # Goal of Vector Quantization is to solve posterior collapse problem
 import torch.nn.functional as F
+from torch import device
 from torch import nn
 import numpy as np
 import torch
@@ -15,7 +16,7 @@ class VectorQuantizer(nn.Module):
     - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
     """
 
-    def __init__(self, n_e, e_dim, beta, device):
+    def __init__(self, n_e, e_dim, beta):
         super(VectorQuantizer, self).__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -23,9 +24,8 @@ class VectorQuantizer(nn.Module):
 
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
-        self.device = device
 
-    def forward(self, z):
+    def forward(self, z: torch.tensor) -> tuple:
         """
         Inputs the output of the encoder network z and maps it to a discrete
         one-hot vector that is the index of the closest embedding vector e_j
@@ -63,7 +63,7 @@ class VectorQuantizer(nn.Module):
         # TODO: maybe need to have to(device)
         min_encodings = torch.zeros(
             min_encoding_indices.shape[0], self.n_e
-        )
+        ).to(z.device)
         
         # perform one hot encoding
         min_encodings.scatter_(1, min_encoding_indices, 1)
@@ -164,7 +164,7 @@ class VQVAE(nn.Module):
         slope: float,
         res_h_dim: int,
         n_res_layers: int,
-        residual_slope: float = 0.08
+        residual_slope: float = 0.08,
     ) -> None:
         super().__init__()
         
@@ -216,7 +216,11 @@ class VQVAE(nn.Module):
             )
         )
         
-        self.vq_layer = VectorQuantizer(num_embeddings, latent_dim, beta)
+        self.vq_layer = VectorQuantizer(
+            num_embeddings, 
+            latent_dim, 
+            beta
+        )
         
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(
@@ -257,7 +261,7 @@ class VQVAE(nn.Module):
 
         
     def forward(self, x):
-        z_encoded = self.encoder(x)
+        z_encoded = self.encoder(x).to(x.device)
         
         (
             recon_loss, 
