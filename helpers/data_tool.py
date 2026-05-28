@@ -161,7 +161,13 @@ class CMSPlots:
         plt.tight_layout()
         plt.show()
         
-    def plot_patches(self, patch_rows: list[tuple], title: str) -> None:
+    def plot_patches(
+        self, 
+        patch_rows: list[tuple], 
+        title: str, 
+        codebook: bool = True
+    ) -> None:
+        
         cols = len(patch_rows[0][0])
         rows = len(patch_rows)
 
@@ -211,7 +217,9 @@ class CMSPlots:
 
                 # Keep your current row-1 transpose logic
                 if i == 1:
-                    patch = patch.T
+                    # TODO: remove this hack later
+                    if codebook:
+                        patch = patch.T
 
                     im = ax.imshow(
                         patch,
