@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
+import os
 
 @dataclass      
 class ModelConfig:
@@ -8,6 +9,8 @@ class ModelConfig:
     Model config class
     """
     
+    model_name: str
+    model_folder: str
     batch_size: int
     beta: np.float64
     learning_rate: np.float64
@@ -19,3 +22,11 @@ class ModelConfig:
     latent_dim: int
     residual_channels: int
     residual_layers: int
+    
+    @property
+    def model_source_path(self) -> str:
+        model_path = os.path.join(
+            self.model_folder,
+            self.model_name + ".pth"
+        )
+        return model_path
