@@ -152,7 +152,6 @@ class CMSVQVAE:
         self.vq.load_state_dict(
             torch.load(self.config.model_source_path)
         )
-        self.vq.eval()
         print(f"Model loaded from path: {self.config.model_source_path}")
     
     """
@@ -166,8 +165,11 @@ class CMSVQVAE:
         )        
         print(f"SUCCESS: Model saved in {self.config.model_source_path}")
     
-    
+    """
+    Patch compression
+    """
     def transform(self, patch: torch.tensor) -> tuple|None:
+        self.vq.eval()
         with torch.no_grad():
             output = self.vq.encoder(patch)
             (
@@ -181,6 +183,9 @@ class CMSVQVAE:
             return recon_loss, z_q
         return None
 
+    """
+    Patch reconstruction after compression
+    """
     def inverse_transform(self, z_q: torch.tensor) -> torch.tensor:
         with torch.no_grad():
             output = self.vq.decoder(z_q)
