@@ -8,13 +8,17 @@ import torch.optim as optim
 from tqdm import tqdm
 import torch, os, sys
 from torchmetrics.regression import MeanSquaredError
-from helpers.model_tool import ModelTool
-from helpers.data_tool import CMSDataTool, \
-                                CMSPlots
 
+from pathlib import Path
 
-from helpers.models import ModelConfig
-from components.vqvae_model.networks import VQVAE
+PROJECT_ROOT = Path.cwd().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# main component classes for running VQ-VAE
+from vqvae_build.helpers.model_tool import ModelTool
+from vqvae_build.helpers.data_tool import CMSPlots
+from vqvae_build.helpers.models import ModelConfig
+from vqvae_build.vqvae_model.networks import VQVAE
 
 # Goal for the VQVAE postprocessing 
 # is to create helper classes that could 
@@ -30,8 +34,7 @@ class CMSVQVAE:
     
     def __init__(
         self, 
-        config: ModelConfig, 
-        train_loader: DataLoader,
+        config: ModelConfig
     ) -> None:
         self.config = config
         
@@ -53,7 +56,6 @@ class CMSVQVAE:
             amsgrad=True
         )
         
-        self.train_loader = train_loader
         self.avg_loss_train = []
         self.avg_mse_loss_train = []
         self.avg_perplexity_train = []
@@ -67,19 +69,28 @@ class CMSVQVAE:
             os.mkdir(config.model_folder)
             print(f"{config.model_folder} folder for saving model states created!")
     
-    # TODO: Add data loaders and continue wwriting training 
-    # loop code
     
-    def fit(self, verbose: bool = False) -> None:
+    def fit(
+            self, 
+            dataset: torch.utils.data.Dataset, 
+            verbose: bool = False
+        ) -> None:
+        
        start_time = datetime.now() 
        
-       for epoch in range(self.config.num_epochs):
+       train_loader = DataLoader(
+            dataset=dataset, 
+            batch_size=self.config.batch_size,
+            shuffle=True
+        ) 
+       
+       for epoch in range(self.config.num_epochs + 1):
             self.vq.train()
             train_perplexity = 0
             train_mse_loss = 0
             train_loss = 0
             
-            for (batch_idx, X_adcs) in enumerate(self.train_loader):
+            for (_, X_adcs) in enumerate(train_loader):
                 self.optimizer.zero_grad()
                 
                 X_adcs = X_adcs.float()
@@ -111,9 +122,9 @@ class CMSVQVAE:
                 self.optimizer.step()
             
             
-            avg_loss_value = train_loss / len(self.train_loader)
-            avg_mse_value = train_mse_loss / len(self.train_loader)
-            avg_perplexity = train_perplexity / len(self.train_loader)
+            avg_loss_value = train_loss / len(train_loader)
+            avg_mse_value = train_mse_loss / len(train_loader)
+            avg_perplexity = train_perplexity / len(train_loader)
             
             self.avg_loss_train.append(avg_loss_value)
             self.avg_mse_loss_train.append(avg_mse_value)
@@ -203,14 +214,14 @@ class CMSVQVAE:
     """
     Generating model specific plot
     
-    curve_type: vq loss | mse loss
+    curve_type: vq loss | mse loss | perplexity
     """    
     def plot_curve(self, curve_type: str) -> None:
         match curve_type:
             case "vq_loss":
                 self.plots.plot_curve(
                     y_values=self.avg_loss_train,
-                    x_values=list(range(self.config.num_epochs)),
+                    x_values=list(range(self.config.num_epochs + 1)),
                     y_title="BCE Average loss",
                     title="VQ VAE, BCE encoder average loss",
                     x_label="Epochs"
@@ -219,7 +230,7 @@ class CMSVQVAE:
             case "mse_loss":
                 self.plots.plot_curve(
                     y_values=self.avg_mse_loss_train,
-                    x_values=list(range(self.config.num_epochs)),
+                    x_values=list(range(self.config.num_epochs + 1)),
                     y_title="MSE Average loss",
                     title="VQ VAE, MSE encoder average loss",
                     x_label="Epochs"
@@ -228,7 +239,7 @@ class CMSVQVAE:
             case "perplexity":
                 self.plots.plot_curve(
                     y_values=self.avg_perplexity_train,
-                    x_values=list(range(self.config.num_epochs)),
+                    x_values=list(range(self.config.num_epochs + 1)),
                     y_title="Perplexity Average",
                     title="VQ VAE, Perplexity average across epochs",
                     x_label="Epochs"
