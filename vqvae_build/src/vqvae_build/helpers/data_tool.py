@@ -28,7 +28,7 @@ class CMSPlots:
         marker: str=None
     ) -> None:
         print(title + " values over epochs")
-        plt.style.use('fivethirtyeight')
+        # plt.style.use('fivethirtyeight')
         plt.figure(figsize=(8, 5))
         plt.plot(x_values, y_values, marker=marker)
         plt.xlabel(x_label)
