@@ -26,6 +26,7 @@ class ModelConfig:
     residual_channels: int
     residual_layers: int
     device: device
+    seed: int
     
     @property
     def model_source_path(self) -> str:
