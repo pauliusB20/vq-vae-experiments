@@ -63,12 +63,15 @@ class CMSVQVAE:
         self.plots = CMSPlots()
         self.model_tool = ModelTool()
         self.mse = MeanSquaredError().to(config.device)
+        device_seed = config.device
+        self.model_tool.set_seed(config.seed, device_seed)
         
         # create helper folders
         if not os.path.exists(config.model_folder):
             os.mkdir(config.model_folder)
             print(f"{config.model_folder} folder for saving model states created!")
-    
+
+        
     
     def fit(
             self, 
@@ -77,6 +80,9 @@ class CMSVQVAE:
         ) -> None:
         
        start_time = datetime.now() 
+       self.avg_loss_train = []
+       self.avg_mse_loss_train = []
+       self.avg_perplexity_train = []
        
        train_loader = DataLoader(
             dataset=dataset, 
@@ -206,6 +212,7 @@ class CMSVQVAE:
     Patch reconstruction after compression
     """
     def inverse_transform(self, z_q: torch.tensor) -> torch.tensor:
+        self.vq.eval()
         with torch.no_grad():
             output = self.vq.decoder(z_q)
             return output
@@ -217,6 +224,7 @@ class CMSVQVAE:
     curve_type: vq loss | mse loss | perplexity
     """    
     def plot_curve(self, curve_type: str) -> None:
+        
         match curve_type:
             case "vq_loss":
                 self.plots.plot_curve(
