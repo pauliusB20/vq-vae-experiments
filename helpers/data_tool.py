@@ -26,14 +26,14 @@ class CMSDataTool:
             module_rows=160,
             module_cols=416
         ):
-    
+
         (
-            width, 
-            height, 
+            d, 
             vq_n_embed
         ) = encoded_size
         
-        vq_bits = width * height * np.log2(vq_n_embed)
+        # TODO: skaiciuoti bit'us
+        vq_bits = d * np.log2(vq_n_embed)
         
         # Patch address bits
         bits_patch_row = np.ceil(
