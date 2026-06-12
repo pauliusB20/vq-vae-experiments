@@ -1,4 +1,4 @@
-# Goal of Vector Quantization is to solve posterior collapse problem
+from abc import ABC, abstractmethod
 import torch.nn.functional as F
 from torch import device
 from torch import nn
@@ -6,34 +6,46 @@ import numpy as np
 import torch
 
 
+class AbstractModule(nn.Module, ABC):
+    
+    def __init__(self) -> None:
+        super().__init__()
+    
+    @abstractmethod
+    def forward(self, x: torch.tensor) -> None:
+        raise NotImplementedError
+
 class EncoderInput(AbstractModule):
     
     # NOTE: encoder_features - from convolution network
     """
-    d: int - how many codebook indexes could an encoded patch have    
+    indexes: int - how many codebook indexes could an encoded patch have    
     encoder_features: int - how many features are in encoder convolution output 
     
     """
-    def __init__(
-        self, 
-        d: int, 
-        slope: np.float64, 
-        encoder_features: int = 2,
-    ) -> None:
-        super().__init__()        
+    def __init__(self, indexes: int, slope: np.float64, latent_dim: int, encoder_features: int = 4) -> None:
+        super().__init__()
+        
+        # TODO: in_features need to come from encoder conv network
         self.encoder_features = encoder_features
         self.layers = nn.Sequential(
-            nn.Linear(in_features=encoder_features, out_features=d),
-            nn.BatchNorm1d(d),
+            nn.Linear(in_features=encoder_features, out_features=indexes),
+            nn.BatchNorm1d(latent_dim),
             nn.LeakyReLU(slope)
         )
         
     def forward(self, x: torch.tensor) -> None:
-        x_output = self.layers(x)
-        return x_output
+        b, c, w, h = x.shape
+        x_flattened = x.reshape(b, c, w * h)
+        x_output = self.layers(x_flattened)
+        (b, c, w) = x_output.shape
+        x_output_flattened = x_output.reshape(b * w, c)
+        return x_output_flattened.contiguous()
     
 
 class DecoderInput(AbstractModule):
+    
+    # NOTE: decoder_features - dinamically add required feature count for decoder
     
     """
     d: int - how many indexes could an encoded patch have
@@ -42,21 +54,29 @@ class DecoderInput(AbstractModule):
     
     def __init__(
         self, 
-        d: int, 
+        indexes: int, 
         slope: np.float64, 
-        decoder_features: int = 2
+        latent_dim: int,
+        decoder_features: int = 4,
     ) -> None:
         super().__init__()
-        
         self.layers = nn.Sequential(
-            nn.Linear(in_features=d, out_features=decoder_features),
-            nn.BatchNorm1d(decoder_features),
+            nn.Linear(in_features=indexes, out_features=decoder_features),
+            nn.BatchNorm1d(latent_dim),
             nn.LeakyReLU(slope)
         )
-        self.decoder_features = decoder_features
         
     def forward(self, x: torch.tensor) -> None:
+        (b, w, c) = x.shape
+        x = x.reshape(b, c, w)
         dec_out = self.layers(x)
+        
+        dec_out = dec_out.reshape(
+            b,
+            c,
+            w,
+            w
+        )
         return dec_out
 
 
@@ -79,7 +99,7 @@ class VectorQuantizer(nn.Module):
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
 
-    def forward(self, z: torch.tensor) -> tuple:
+    def forward(self, z, indexes: int):
         """
         Inputs the output of the encoder network z and maps it to a discrete
         one-hot vector that is the index of the closest embedding vector e_j
@@ -95,17 +115,17 @@ class VectorQuantizer(nn.Module):
 
         """
         # reshape z -> (batch, height, width, channel) and flatten
-        z = z.permute(0, 2, 3, 1).contiguous()
-        z_flattened = z.view(-1, self.e_dim)
+        # z = z.permute(0, 2, 3, 1).contiguous()
+        # z_flattened = z.view(-1, self.e_dim).contiguous()
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
 
         # NOTE: is a matrix learnable vector for learning codebook indices. 
         codebook = self.embedding.weight
         
         # Euclidean distance for finding closest codebooks
-        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
+        d = torch.sum(z ** 2, dim=1, keepdim=True) + \
             torch.sum(self.embedding.weight**2, dim=1) - 2 * \
-            torch.matmul(z_flattened, codebook.t())
+            torch.matmul(z, codebook.t())
             
         # Result -> d gets dimensions from matrix torch.matmul(z_flattened, self.embedding.weight.t())
         # embedding weight t is defined by num_embeddings, latent_dim
@@ -113,11 +133,8 @@ class VectorQuantizer(nn.Module):
             
         # find closest encodings
         min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
-        
-        # TODO: maybe need to have to(device)
         min_encodings = torch.zeros(
-            min_encoding_indices.shape[0], self.n_e
-        ).to(z.device)
+            min_encoding_indices.shape[0], self.n_e).to(device)
         
         # perform one hot encoding
         min_encodings.scatter_(1, min_encoding_indices, 1)
@@ -131,7 +148,12 @@ class VectorQuantizer(nn.Module):
         loss = torch.mean((z_q.detach() - z)**2) + self.beta * \
             torch.mean((z_q - z.detach()) ** 2)
 
-        # preserve gradients with preservation trick
+        # preserve gradients with preservation trick. Allows gradients to exist
+        # (z_q - z.detach() )- is like a constant
+
+        # We make quantized latent space vector to get closer to the encoder output
+        # we highliht the codewords and gradually each epoch we force neaigoboring pixels
+        # to be associating with cendroids
         z_q = z + (z_q - z).detach()
 
         # perplexity - average of weights of probabilities
@@ -139,20 +161,11 @@ class VectorQuantizer(nn.Module):
         
         # Measures how many codebook vectors are beeing used
         perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
+        
+        z_q = z_q.reshape(-1, indexes, self.e_dim)
 
-        # reshape back to match original input shape
-        # contiguous() is used for improving performance
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
-
-        return (
-            loss, 
-            z_q, 
-            perplexity, 
-            min_encodings, 
-            min_encoding_indices, 
-            codebook
-        )
-    
+        return loss, z_q, perplexity, min_encodings, min_encoding_indices, codebook
+        
 class ResidualLayer(nn.Module):
     """
     One residual layer inputs:
@@ -219,11 +232,11 @@ class VQVAE(nn.Module):
         slope: float,
         res_h_dim: int,
         n_res_layers: int,
-        d: int,
+        device: device,
+        encoded_patch_indexes: int,
         residual_slope: float = 0.08,
     ) -> None:
         super().__init__()
-        
         self.encoder = nn.Sequential(   
             nn.Conv2d(
                 channels, 
@@ -272,15 +285,22 @@ class VQVAE(nn.Module):
             )
         )
         
-        self.fc_encoder_input = EncoderInput(d=d, slope=slope)
+        self.fc_encoder_input = EncoderInput(
+            encoded_patch_indexes=encoded_patch_indexes, 
+            slope=slope
+        )
         
         self.vq_layer = VectorQuantizer(
             num_embeddings, 
             latent_dim, 
-            beta
+            beta,
+            device=device
         )
         
-        self.fc_decoder_input = DecoderInput(d=d, latent_dim=latent_dim, slope=slope)
+        self.fc_decoder_input = DecoderInput(
+            encoded_patch_indexes=encoded_patch_indexes, 
+            slope=slope
+        )
         
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(
@@ -302,7 +322,14 @@ class VQVAE(nn.Module):
                 n_res_layers, 
                 residual_slope
             ),
-            nn.ConvTranspose2d(hidden_channels * 2, hidden_channels, kernel_size=kernel_size, stride=2, padding=1, bias=False),
+            nn.ConvTranspose2d(
+                hidden_channels * 2, 
+                hidden_channels, 
+                kernel_size=kernel_size, 
+                stride=2, 
+                padding=1, 
+                bias=False
+            ),
             nn.GroupNorm(
                 num_groups=8, 
                 num_channels=hidden_channels
@@ -318,10 +345,15 @@ class VQVAE(nn.Module):
             ),
             nn.Sigmoid()
         )
+        self.device = device
 
         
     def forward(self, x):
-        z_encoded = self.encoder(x).to(x.device)
+        encoder_output = self.encoder(x)
+        b, c, w, h = encoder_output.shape
+        encoder_flatten = encoder_output.view(b * c * h, w)
+        
+        z = self.fc_encoder_input(encoder_flatten)
         
         (
             recon_loss, 
@@ -330,9 +362,11 @@ class VQVAE(nn.Module):
             min_encodings, 
             min_encoding_indices, 
             codebook
-        ) = self.vq_layer(z_encoded)
+        ) = self.vq_layer(z)
         
-        output = self.decoder(z_q)
+        z_q = self.fc_decoder_input(z_q)
+        decoder_input = z_q.view(b, c, h, w)        
+        output = self.decoder(decoder_input)
         
         return (
             output, 

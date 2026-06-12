@@ -26,6 +26,7 @@ from vqvae_build.vqvae_model.networks import VQVAE
 
 # Develop main VQVAE class for the pileup ml project
 
+# TODO: Apply new fixes
 class CMSVQVAE:
     
     """
@@ -47,7 +48,9 @@ class CMSVQVAE:
             latent_dim=self.config.latent_dim,
             beta=self.config.beta,
             n_res_layers=self.config.residual_layers, # residual hidden layers
-            res_h_dim=self.config.residual_channels # residual hidden channels
+            res_h_dim=self.config.residual_channels, # residual hidden channels
+            encoded_patch_indexes=self.config.encoded_patch_indexes,
+            device=self.config.device
         ).to(self.config.device)
 
         self.optimizer = optim.Adam(
@@ -78,6 +81,7 @@ class CMSVQVAE:
             dataset: torch.utils.data.Dataset, 
             verbose: bool = False
         ) -> None:
+        
         
        start_time = datetime.now() 
        self.avg_loss_train = []
@@ -139,7 +143,8 @@ class CMSVQVAE:
             if verbose:
                 print(
                     f"Epoch ({epoch}/{self.config.num_epochs})"
-                    f" model VQ_LOSS + BCE Loss = {avg_loss_value}"
+                    f" model VQ_LOSS + BCE Loss = {avg_loss_value},"
+                    f" avg model codebook perplexity = {avg_perplexity}"
                 )
        
        self.total_execution = (datetime.now() - start_time).seconds 
@@ -198,15 +203,14 @@ class CMSVQVAE:
         with torch.no_grad():
             output = self.vq.encoder(patch)
             (
-                recon_loss, 
+                recon_loss, # debug 
                 z_q, 
                 perplexity, 
-                min_encodings, 
-                min_encoding_indices, 
-                codebook
+                min_encodings, # debug
+                min_encoding_indices, # debug
+                codebook # debug
             ) = self.vq.vq_layer(output)
-            return perplexity, z_q
-        return None
+        return perplexity, z_q
 
     """
     Patch reconstruction after compression
@@ -215,8 +219,7 @@ class CMSVQVAE:
         self.vq.eval()
         with torch.no_grad():
             output = self.vq.decoder(z_q)
-            return output
-        return None
+        return output
      
     """
     Generating model specific plot

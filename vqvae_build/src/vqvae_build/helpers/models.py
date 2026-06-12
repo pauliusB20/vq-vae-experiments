@@ -3,6 +3,8 @@ from torch import device
 import numpy as np
 import os
 
+
+
 @dataclass      
 class ModelConfig:
     
@@ -27,6 +29,7 @@ class ModelConfig:
     residual_layers: int
     device: device
     seed: int
+    encoded_patch_indexes: int
     
     @property
     def model_source_path(self) -> str:
