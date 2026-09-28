@@ -3,8 +3,6 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")  # headless-safe (e.g. running under tmux with no display)
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -15,9 +13,9 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from pileup_ml.detectors.strips import StripsDetector
-from pileup_ml.strips.hits import StripDigiEvent
-from pileup_ml.strips.segments import event_hits_to_segments
+from pileup_ml.detectors.pixels import PixelDetector, PixelModule
+from pileup_ml.pixels.hits import PixelDigiEvent
+from pileup_ml.pixels.patches import event_hits_to_patches
 
 from pythae.data.datasets import DatasetOutput
 from pythae.models import VQVAE, VQVAEConfig
@@ -30,16 +28,15 @@ load_dotenv()
 
 # TEST_ITERATIONS = 10
 BIT_DEPTHS = [8, 12, 16, 20, 24]
-SEGMENT_SIZES = [8, 12, 16, 20]
+PIXEL_SIZES = [8, 12, 16, 20]
 # BIT_DEPTHS = [8]
 # SEGMENT_SIZES = [8]
 CHANNELS = 1
 EVENT_COUNT_TRAIN = 3
 EVENT_COUNT_TEST = 80
-ADC_MAX = 1023
+ADC_MAX = 255
 SEED = 123
-OUTPUT_DIR = "my_custom_vqvae_model"
-PLOT_PATH = "vqvae_strips_rmse_adc_vs_bit_depth_by_segment_size.png"
+OUTPUT_DIR = "vqvae_pythae_pixels"
 
 KERNEL_SIZE = 4
 STRIDE = 2
@@ -47,7 +44,6 @@ PADDING = 1
 ENCODED_PATCH_INDEXES = 4
 EPOCHS = 100
 BATCH_SIZE = 2**13
-
 
 def codebook_size(bit_depth: int) -> int:
     # NOTE: kept from the original code. For bit_depth=8 this is only 4 codes.
@@ -61,16 +57,16 @@ class CustomVQVAEConfig(VQVAEConfig):
     hidden_channels: int = 16
 
 
-class ResBlock1d(nn.Module):
+class ResBlock2d(nn.Module):
     """Port of `ResBlock` from vqvae_layers.py, using Conv1d for 1D vector data."""
 
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         self.conv_block = nn.Sequential(
             nn.ReLU(),
-            nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Conv1d(out_channels, in_channels, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(out_channels, in_channels, kernel_size=1, stride=1, padding=0),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -91,17 +87,17 @@ class CustomEncoderConv(BaseEncoder):
         self.encoded_patch_indexes = ENCODED_PATCH_INDEXES
 
         self.model = nn.Sequential(
-            nn.Conv1d(channels, hidden_channels, kernel_size=KERNEL_SIZE,
+            nn.Conv2d(channels, hidden_channels, kernel_size=KERNEL_SIZE,
                       stride=STRIDE, padding=PADDING),
             nn.GroupNorm(8, hidden_channels),
             nn.ReLU(inplace=True),
-            nn.Conv1d(hidden_channels, latent_dim, kernel_size=KERNEL_SIZE - 1,
+            nn.Conv2d(hidden_channels, latent_dim, kernel_size=KERNEL_SIZE - 1,
                       padding=PADDING),
         )
         self.adaptive_avg_1d = nn.AdaptiveAvgPool1d(ENCODED_PATCH_INDEXES)
         self.residual = nn.Sequential(
-            ResBlock1d(latent_dim, latent_dim // 2),
-            ResBlock1d(latent_dim, latent_dim // 2),
+            ResBlock2d(latent_dim, latent_dim // 2),
+            ResBlock2d(latent_dim, latent_dim // 2),
         )
 
     def forward(self, x: torch.Tensor) -> ModelOutput:
@@ -126,16 +122,16 @@ class CustomDecoderConv(BaseDecoder):
         self.segment_size = model_config.input_dim[-1]
 
         self.residual = nn.Sequential(
-            ResBlock1d(latent_dim, latent_dim // 2),
-            ResBlock1d(latent_dim, latent_dim // 2),
+            ResBlock2d(latent_dim, latent_dim // 2),
+            ResBlock2d(latent_dim, latent_dim // 2),
             nn.ReLU(),
         )
         self.model = nn.Sequential(
-            nn.ConvTranspose1d(latent_dim, hidden_channels, kernel_size=KERNEL_SIZE - 1,
+            nn.ConvTranspose2d(latent_dim, hidden_channels, kernel_size=KERNEL_SIZE - 1,
                                padding=PADDING),
             nn.GroupNorm(8, hidden_channels),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(hidden_channels, channels, kernel_size=KERNEL_SIZE,
+            nn.ConvTranspose2d(hidden_channels, channels, kernel_size=KERNEL_SIZE,
                                stride=STRIDE, padding=PADDING),
         )
 
@@ -163,47 +159,56 @@ class AddNormalization:
         return f"{self.__class__.__name__} ()"
 
 
-class StripSegmentsDataset(Dataset):
-    """Torch dataset turning strip segments into (1, segment_size) tensors."""
+class PixelsDataset(Dataset):
+    """
+    Pytorch dataset class for making PixelEventHit adcs into tensors
 
-    def __init__(self, segments: np.ndarray, transform=None):
-        self.segments = segments
+    Returns:
+        torch.Tensor: adcs patches as tensors
+    """
+    
+    def __init__(self, patches: np.ndarray, patch_size: int, transform=None):
+        self.event_patches_adcs = [
+            patch.reshape(patch_size, patch_size)
+            for patch in patches
+        ]
         self.transform = transform
 
     def __len__(self) -> int:
-        return len(self.segments)
+        return len(self.event_patches_adcs)
 
-    def __getitem__(self, index: int) -> DatasetOutput:
-        # uint16 -> int32: older torch versions cannot convert uint16 arrays
-        segment = torch.as_tensor(self.segments[index].astype(np.int32))
-        segment = segment.unsqueeze(0)
+    def __getitem__(self, index: int) -> np.ndarray | torch.Tensor:
+        event_patch = self.event_patches_adcs[index]
+        
+        # Applying the transform
         if self.transform:
-            segment = self.transform(segment)
-        return DatasetOutput(data=segment)
+            event_patch = self.transform(event_patch)
+        
+        return event_patch
 
 
 class Helper:
 
     @staticmethod
-    def hits_to_vectors(event: StripDigiEvent, segment_size: int) -> np.ndarray:
-        return event_hits_to_segments(
+    def hits_to_blocks(event: PixelDigiEvent, patches_size: int) -> np.ndarray:
+        return event_hits_to_patches(
             event,
-            segment_size=segment_size,
+            segment_size=patches_size,
             fill_value=0,
             dtype=np.uint16,
         ).as_array()
 
     @staticmethod
-    def get_strips_sets(
-        strip_events_train: list[StripDigiEvent],
-        strip_events_test: list[StripDigiEvent],
-        segment_size: int,
+    def get_patches_sets(
+        pixels_events_train: list[PixelDigiEvent],
+        pixels_events_test: list[PixelDigiEvent],
+        patch_size: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         train = np.concatenate(
-            [Helper.hits_to_vectors(e, segment_size) for e in strip_events_train]
+            [Helper.hits_to_blocks(e, patch_size) for e in pixels_events_train]
         )
         test = np.concatenate(
-            [Helper.hits_to_vectors(e, segment_size) for e in strip_events_test]
+            [Helper.hits_to_blocks(e, patch_size) for e in pixels_events_test]
         )
         return train, test
 
@@ -220,9 +225,7 @@ def reconstruct(model, data: torch.Tensor, device, batch_size: int = 256) -> tor
 
 
 def rmse(original: torch.Tensor, reconstructed: torch.Tensor) -> float:
-    """Mean over samples of the per-sample RMSE, in ADC counts."""
-    original = original * ADC_MAX
-    reconstructed = reconstructed * ADC_MAX
+    """Mean over samples of the per-sample root-mean-square error."""
     diff = (original - reconstructed).reshape(original.shape[0], -1)
     per_sample_mse = torch.mean(diff ** 2, dim=1)
     return torch.sqrt(per_sample_mse).mean().item()
@@ -237,17 +240,17 @@ def plot_rmse(rmse_values: dict, bit_depths: list[int], out_path: str) -> None:
     for segment, values in sorted(rmse_values.items()):
         ax.plot(bit_depths, values, marker="o", label=f"Segment size {segment}")
     ax.set_xlabel("Bit depth")
-    ax.set_ylabel("RMSE (ADC)")
+    ax.set_ylabel("RMSE (normalized units)")
     ax.set_title("VQ-VAE RMSE by segment size")
     ax.set_xticks(bit_depths)
     ax.legend()
     ax.grid(alpha=0.3)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    plt.show()
 
 
 def main() -> None:
-    print("Starting Pythae based custom VQ-VAE testing")
+    print("Starting Pythae based custom VQ-VAE testing based on Pixel data")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -256,27 +259,27 @@ def main() -> None:
     torch.backends.cudnn.benchmark = False
 
     print("Loading strip data")
-    detector_info = Path(os.environ["DETID_INFO_DIR"])
-    root_dir = Path(os.environ["STRIP_ROOT_FILE_DIR"])
-    strip_detector = StripsDetector.load(detector_info)
-    strip_events_train = StripDigiEvent.read_root(
-        root_dir / "0001_10.root", detector=strip_detector
+    pixel_modules = PixelModule.read_json('/data/cern/pileup_ml/detid_info/detids_bpix.json', '/data/cern/pileup_ml/detid_info/detids_fpix.json')
+    pixel_detector = PixelDetector(pixel_modules)
+    
+    pixels_events_train = PixelDigiEvent.read_root(
+        "/data/cern/pileup_ml/premixlib2024/0001.root", detector=pixel_detector
     )[:EVENT_COUNT_TRAIN]
-    strip_events_test = StripDigiEvent.read_root(
-        root_dir / "0002_100.root", detector=strip_detector
+    pixels_events_test = PixelDigiEvent.read_root(
+       "/data/cern/pileup_ml/premixlib2024/0002.root", detector=pixel_detector
     )[:EVENT_COUNT_TEST]
 
     data_transform = transforms.Compose([AddNormalization()])
     rmse_values = defaultdict(list)
 
-    for segment in SEGMENT_SIZES:
-        strip_segments_train, strip_segments_test = Helper.get_strips_sets(
-            strip_events_train, strip_events_test, segment
+    for pixel_size in PIXEL_SIZES:
+        pixels_events_train, pixels_events_test = Helper.get_strips_sets(
+            pixels_events_train, pixels_events_test, pixel_size
         )
         # Rebuild the data for every segment size
-        print(f"Preparing train and test data for segment size {segment}")
-        vqvae_trainset = StripSegmentsDataset(strip_segments_train, data_transform)
-        vqvae_testset = StripSegmentsDataset(strip_segments_test, data_transform)
+        print(f"Preparing train and test data for segment size {pixel_size}")
+        vqvae_trainset = PixelsDataset(pixels_events_train, pixel_size, data_transform)
+        vqvae_testset = PixelsDataset(pixels_events_test, pixel_size, data_transform)
         test_data = dataset_to_tensor(vqvae_testset)
 
         for bit_depth in BIT_DEPTHS:
@@ -285,14 +288,14 @@ def main() -> None:
 
             num_embeddings = codebook_size(bit_depth)
             print(f"Applying: num_embeddings = {num_embeddings} "
-                  f"(bit_depth={bit_depth}), segment_size = {segment}")
+                  f"(bit_depth={bit_depth}), pixel_size = {pixel_size}")
 
             # Fresh seed, config, encoder and decoder for every run so runs are independent
             torch.manual_seed(SEED)
             np.random.seed(SEED)
 
             model_config = CustomVQVAEConfig(
-                input_dim=(CHANNELS, segment),
+                input_dim=(CHANNELS, pixel_size),
                 latent_dim=32,
                 hidden_channels=16,
                 num_embeddings=num_embeddings,
@@ -313,7 +316,7 @@ def main() -> None:
             print(f"quantizer: {type(model.quantizer).__name__}")
 
             training_config = BaseTrainerConfig(
-                output_dir=os.path.join(OUTPUT_DIR, f"seg{segment}_bd{bit_depth}"),
+                output_dir=os.path.join(OUTPUT_DIR, f"pixels{pixel_size}_bd{bit_depth}"),
                 learning_rate=1e-3,
                 per_device_train_batch_size=BATCH_SIZE,
                 per_device_eval_batch_size=BATCH_SIZE,
@@ -329,19 +332,23 @@ def main() -> None:
             print(reconstructions.shape)
 
             overall_rmse = rmse(test_data, reconstructions)
-            rmse_values[segment].append(overall_rmse)
+            rmse_values[pixel_size].append(overall_rmse)
 
-            print(f"RMSE (eval set): {overall_rmse:.2f} ADC")
+            print(f"RMSE (eval set): {overall_rmse:.6f} normalized "
+                  f"({overall_rmse * ADC_MAX:.2f} ADC)")
 
             elapsed = (datetime.now() - start_time).total_seconds()
             print(f"Finished at {datetime.now():%Y-%m-%d %H:%M:%S}")
             print(f"Time difference = {elapsed:.0f} seconds\n------------------")
 
-    # Plot once, after all segment sizes and bit depths have finished
-    print("Plotting overall rmse")
-    plot_rmse(rmse_values, BIT_DEPTHS, PLOT_PATH)
-    print(f"Saved plot to {PLOT_PATH}")
-    print("DONE")
+            print("Plotting overall patch based on different bit depth pixel VQ-VAE model rmse")
+        
+        plot_rmse(
+            rmse_values,
+            BIT_DEPTHS,
+            "vqvae_pixels_reconstruction_rmse_vs_bit_depth.png",
+        )
+        print("DONE")
 
 
 if __name__ == "__main__":
