@@ -1,5 +1,6 @@
 import os
 from collections import defaultdict
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -15,9 +16,10 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from pileup_ml.compression.metrics import compare_hit_presence, compare_matching_hits
 from pileup_ml.detectors.strips import StripsDetector
 from pileup_ml.strips.hits import StripDigiEvent
-from pileup_ml.strips.segments import event_hits_to_segments
+from pileup_ml.strips.segments import event_hits_to_segments, event_segments_to_hits
 
 from pythae.data.datasets import DatasetOutput
 from pythae.models import VQVAE, VQVAEConfig
@@ -40,6 +42,8 @@ ADC_MAX = 1023
 SEED = 123
 OUTPUT_DIR = "my_custom_vqvae_model"
 PLOT_PATH = "vqvae_strips_rmse_adc_vs_bit_depth_by_segment_size.png"
+PRECISION_PLOT_PATH = "vqvae_strips_precision_vs_bit_depth_by_segment_size.png"
+RECALL_PLOT_PATH = "vqvae_strips_recall_vs_bit_depth_by_segment_size.png"
 
 KERNEL_SIZE = 4
 STRIDE = 2
@@ -113,7 +117,15 @@ class CustomEncoderConv(BaseEncoder):
 
 
 class CustomDecoderConv(BaseDecoder):
-    """Port of `DecoderConv`, unflattening the 2D quantized vector from pythae's VQVAE."""
+    """Port of `DecoderConv`, unflattening the 2D quantized vector from pythae's VQVAE.
+
+    Outputs raw logits (no final sigmoid) -- reconstruction loss is computed
+    with `F.binary_cross_entropy_with_logits`, which is numerically more
+    stable than applying `sigmoid()` here and then plain BCE (see
+    `CustomVQVAE._get_vae_loss` below). Apply `torch.sigmoid()` to
+    `recon_x` yourself wherever you need an actual [0, 1] reconstruction
+    (e.g. `reconstruct()` below).
+    """
 
     def __init__(self, model_config: CustomVQVAEConfig) -> None:
         BaseDecoder.__init__(self)
@@ -148,8 +160,44 @@ class CustomDecoderConv(BaseDecoder):
         if out.shape[-1] != self.segment_size:
             out = F.interpolate(out, size=self.segment_size, mode="linear",
                                 align_corners=False)
-        out = torch.sigmoid(out)            # reconstruction in [0, 1]
+        # NOTE: raw logits returned here -- no sigmoid. See class docstring.
         return ModelOutput(reconstruction=out)
+
+
+class CustomVQVAE(VQVAE):
+    """pythae's VQVAE with its default MSE reconstruction loss swapped for
+    BCE-with-logits, so this baseline's loss matches the main model's (also
+    EMA + BCE-with-logits). Everything else (encoder, quantizer selection via
+    `_set_quantizer`, `forward`) is untouched -- only `loss_function` is
+    overridden.
+    """
+
+    def _get_vae_loss(
+        self,
+        recon_x: torch.Tensor,
+        x: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        VAE binary cross entropy loss
+        """
+        recon_loss = F.binary_cross_entropy_with_logits(
+            recon_x,
+            x,
+            reduction="mean"
+        )
+
+        return recon_loss
+
+    def loss_function(self, recon_x, x, quantizer_output):
+        recon_loss = self._get_vae_loss(recon_x, x)
+
+        vq_loss = quantizer_output.loss
+
+        return (
+            recon_loss + vq_loss.mean(dim=0),
+            recon_loss,
+            vq_loss.mean(dim=0),
+        )
 
 
 class AddNormalization:
@@ -182,30 +230,13 @@ class StripSegmentsDataset(Dataset):
         return DatasetOutput(data=segment)
 
 
-class Helper:
-
-    @staticmethod
-    def hits_to_vectors(event: StripDigiEvent, segment_size: int) -> np.ndarray:
-        return event_hits_to_segments(
-            event,
-            segment_size=segment_size,
-            fill_value=0,
-            dtype=np.uint16,
-        ).as_array()
-
-    @staticmethod
-    def get_strips_sets(
-        strip_events_train: list[StripDigiEvent],
-        strip_events_test: list[StripDigiEvent],
-        segment_size: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        train = np.concatenate(
-            [Helper.hits_to_vectors(e, segment_size) for e in strip_events_train]
-        )
-        test = np.concatenate(
-            [Helper.hits_to_vectors(e, segment_size) for e in strip_events_test]
-        )
-        return train, test
+def get_train_segments(events: list[StripDigiEvent], segment_size: int) -> np.ndarray:
+    """All non-empty segments of the training events as one (N, segment_size) array."""
+    return np.concatenate([
+        event_hits_to_segments(e, segment_size=segment_size, fill_value=0,
+                               dtype=np.uint16).as_array()
+        for e in events
+    ])
 
 
 @torch.no_grad()
@@ -215,30 +246,48 @@ def reconstruct(model, data: torch.Tensor, device, batch_size: int = 256) -> tor
     for start in range(0, data.shape[0], batch_size):
         batch = data[start:start + batch_size].to(device)
         out = model({"data": batch})
-        outputs.append(out.recon_x.cpu())
+        recon = torch.sigmoid(out.recon_x)  # logits -> [0, 1] reconstruction
+        outputs.append(recon.cpu())
     return torch.cat(outputs, dim=0)
 
 
-def rmse(original: torch.Tensor, reconstructed: torch.Tensor) -> float:
-    """Mean over samples of the per-sample RMSE, in ADC counts."""
-    original = original * ADC_MAX
-    reconstructed = reconstructed * ADC_MAX
-    diff = (original - reconstructed).reshape(original.shape[0], -1)
-    per_sample_mse = torch.mean(diff ** 2, dim=1)
-    return torch.sqrt(per_sample_mse).mean().item()
+def reconstruct_event(model, event: StripDigiEvent, segment_size: int, device) -> StripDigiEvent:
+    """Round-trip one event: hits -> segments -> VQ-VAE -> segments -> hits."""
+    blocks = event_hits_to_segments(event, segment_size=segment_size, fill_value=0,
+                                    dtype=np.uint16)
+    if len(blocks) == 0:
+        return event
+
+    x = AddNormalization()(torch.as_tensor(blocks.as_array().astype(np.int32)))
+    recon = reconstruct(model, x.unsqueeze(1), device).squeeze(1).numpy() * ADC_MAX
+
+    # Same decoding as StripCompression.vectors_to_blocks: round to ADC counts,
+    # and a strip is a hit only if its rounded ADC is > 0.
+    adcs = np.round(recon).clip(0, ADC_MAX).astype(np.uint16)
+    blocks = replace(blocks, adcs=adcs, occupancy=adcs > 0)
+    return event_segments_to_hits(blocks)
 
 
-def dataset_to_tensor(dataset: Dataset) -> torch.Tensor:
-    return torch.stack([dataset[i]["data"] for i in range(len(dataset))])  # (N, 1, L)
+def evaluate(model, events: list[StripDigiEvent], segment_size: int, device) -> dict[str, float]:
+    """RMSE over matching hits plus hit-presence precision/recall (pileup_ml metrics)."""
+    reconstructed = [reconstruct_event(model, e, segment_size, device) for e in events]
+
+    precision, recall = compare_hit_presence(events, reconstructed)
+    try:
+        rmse = compare_matching_hits(events, reconstructed, metric="rmse")
+    except ValueError:  # no strip is a hit in both original and reconstruction
+        rmse = float("nan")
+    return {"rmse": rmse, "precision": precision, "recall": recall}
 
 
-def plot_rmse(rmse_values: dict, bit_depths: list[int], out_path: str) -> None:
+def plot_metric(values: dict, bit_depths: list[int], ylabel: str, title: str,
+                out_path: str) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    for segment, values in sorted(rmse_values.items()):
-        ax.plot(bit_depths, values, marker="o", label=f"Segment size {segment}")
+    for segment, vals in sorted(values.items()):
+        ax.plot(bit_depths, vals, marker="o", label=f"Segment size {segment}")
     ax.set_xlabel("Bit depth")
-    ax.set_ylabel("RMSE (ADC)")
-    ax.set_title("VQ-VAE RMSE by segment size")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.set_xticks(bit_depths)
     ax.legend()
     ax.grid(alpha=0.3)
@@ -267,17 +316,14 @@ def main() -> None:
     )[:EVENT_COUNT_TEST]
 
     data_transform = transforms.Compose([AddNormalization()])
-    rmse_values = defaultdict(list)
+    metric_values = {name: defaultdict(list) for name in ("rmse", "precision", "recall")}
 
     for segment in SEGMENT_SIZES:
-        strip_segments_train, strip_segments_test = Helper.get_strips_sets(
-            strip_events_train, strip_events_test, segment
+        # Rebuild the training data for every segment size
+        print(f"Preparing train data for segment size {segment}")
+        vqvae_trainset = StripSegmentsDataset(
+            get_train_segments(strip_events_train, segment), data_transform
         )
-        # Rebuild the data for every segment size
-        print(f"Preparing train and test data for segment size {segment}")
-        vqvae_trainset = StripSegmentsDataset(strip_segments_train, data_transform)
-        vqvae_testset = StripSegmentsDataset(strip_segments_test, data_transform)
-        test_data = dataset_to_tensor(vqvae_testset)
 
         for bit_depth in BIT_DEPTHS:
             start_time = datetime.now()
@@ -303,7 +349,10 @@ def main() -> None:
             encoder = CustomEncoderConv(model_config)
             decoder = CustomDecoderConv(model_config)
 
-            model = VQVAE(
+            # CustomVQVAE = pythae's VQVAE + BCE-with-logits reconstruction loss
+            # (instead of the default MSE), so this baseline's loss matches the
+            # main model's loss.
+            model = CustomVQVAE(
                 model_config=model_config,
                 encoder=encoder,
                 decoder=decoder,
@@ -325,22 +374,26 @@ def main() -> None:
 
             # Use the in-memory trained model (avoids reloading from the wrong folder
             # and AutoModel dropping the custom `hidden_channels` config field).
-            reconstructions = reconstruct(model, test_data, device)
-            print(reconstructions.shape)
+            results = evaluate(model, strip_events_test, segment, device)
+            for name, value in results.items():
+                metric_values[name][segment].append(value)
 
-            overall_rmse = rmse(test_data, reconstructions)
-            rmse_values[segment].append(overall_rmse)
-
-            print(f"RMSE (eval set): {overall_rmse:.2f} ADC")
+            print(f"RMSE (matching hits): {results['rmse']:.2f} ADC | "
+                  f"precision: {results['precision']:.4f} | recall: {results['recall']:.4f}")
 
             elapsed = (datetime.now() - start_time).total_seconds()
             print(f"Finished at {datetime.now():%Y-%m-%d %H:%M:%S}")
             print(f"Time difference = {elapsed:.0f} seconds\n------------------")
 
     # Plot once, after all segment sizes and bit depths have finished
-    print("Plotting overall rmse")
-    plot_rmse(rmse_values, BIT_DEPTHS, PLOT_PATH)
-    print(f"Saved plot to {PLOT_PATH}")
+    print("Plotting metrics")
+    plot_metric(metric_values["rmse"], BIT_DEPTHS, "RMSE (ADC)",
+                "VQ-VAE RMSE by segment size", PLOT_PATH)
+    plot_metric(metric_values["precision"], BIT_DEPTHS, "Precision",
+                "VQ-VAE hit precision by segment size", PRECISION_PLOT_PATH)
+    plot_metric(metric_values["recall"], BIT_DEPTHS, "Recall",
+                "VQ-VAE hit recall by segment size", RECALL_PLOT_PATH)
+    print(f"Saved plots to {PLOT_PATH}, {PRECISION_PLOT_PATH}, {RECALL_PLOT_PATH}")
     print("DONE")
 
 

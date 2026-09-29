@@ -3,6 +3,8 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")  # headless-safe (e.g. running under tmux with no display)
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -23,6 +25,7 @@ from pythae.models.base.base_utils import ModelOutput
 from pythae.models.nn import BaseDecoder, BaseEncoder
 from pythae.pipelines.training import TrainingPipeline
 from pythae.trainers import BaseTrainerConfig
+from sklearn.metrics import mean_squared_error 
 
 load_dotenv()
 
@@ -30,13 +33,14 @@ load_dotenv()
 BIT_DEPTHS = [8, 12, 16, 20, 24]
 PIXEL_SIZES = [8, 12, 16, 20]
 # BIT_DEPTHS = [8]
-# SEGMENT_SIZES = [8]
+# PIXEL_SIZES = [8]
 CHANNELS = 1
 EVENT_COUNT_TRAIN = 3
 EVENT_COUNT_TEST = 80
 ADC_MAX = 255
 SEED = 123
 OUTPUT_DIR = "vqvae_pythae_pixels"
+PLOT_PATH = "vqvae_pixels_reconstruction_rmse_vs_bit_depth.png"
 
 KERNEL_SIZE = 4
 STRIDE = 2
@@ -44,6 +48,7 @@ PADDING = 1
 ENCODED_PATCH_INDEXES = 4
 EPOCHS = 100
 BATCH_SIZE = 2**13
+
 
 def codebook_size(bit_depth: int) -> int:
     # NOTE: kept from the original code. For bit_depth=8 this is only 4 codes.
@@ -53,12 +58,12 @@ def codebook_size(bit_depth: int) -> int:
 
 @pydantic_dataclass
 class CustomVQVAEConfig(VQVAEConfig):
-    """pythae VQVAEConfig + the extra field needed for the Conv1d encoder/decoder."""
+    """pythae VQVAEConfig + the extra field needed for the Conv2d encoder/decoder."""
     hidden_channels: int = 16
 
 
 class ResBlock2d(nn.Module):
-    """Port of `ResBlock` from vqvae_layers.py, using Conv1d for 1D vector data."""
+    """Port of `ResBlock` from vqvae_layers.py, using Conv2d for 2D pixel patches."""
 
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
@@ -75,7 +80,13 @@ class ResBlock2d(nn.Module):
 
 class CustomEncoderConv(BaseEncoder):
     """Port of `EncoderConv`, flattened to a 2D embedding so pythae's stock
-    `VQVAE` / `QuantizerEMA` can be used as-is."""
+    `VQVAE` / `QuantizerEMA` can be used as-is.
+
+    NOTE (fix vs. the version you pasted): pooling/residual here use the 2D
+    (`AdaptiveAvgPool2d`) variants, since a Conv2d stack produces a 4D
+    `(N, C, H, W)` feature map -- `AdaptiveAvgPool1d`/`ResBlock1d`-style 1D
+    ops (as used in the strips script) can't operate on that.
+    """
 
     def __init__(self, model_config: CustomVQVAEConfig) -> None:
         BaseEncoder.__init__(self)
@@ -94,22 +105,28 @@ class CustomEncoderConv(BaseEncoder):
             nn.Conv2d(hidden_channels, latent_dim, kernel_size=KERNEL_SIZE - 1,
                       padding=PADDING),
         )
-        self.adaptive_avg_1d = nn.AdaptiveAvgPool1d(ENCODED_PATCH_INDEXES)
+        self.adaptive_avg_2d = nn.AdaptiveAvgPool2d((ENCODED_PATCH_INDEXES, ENCODED_PATCH_INDEXES))
         self.residual = nn.Sequential(
             ResBlock2d(latent_dim, latent_dim // 2),
             ResBlock2d(latent_dim, latent_dim // 2),
         )
 
     def forward(self, x: torch.Tensor) -> ModelOutput:
-        out = self.model(x)                 # (N, latent_dim, L')
-        out = self.adaptive_avg_1d(out)     # (N, latent_dim, ENCODED_PATCH_INDEXES)
+        out = self.model(x)                 # (N, latent_dim, H', W')
+        out = self.adaptive_avg_2d(out)      # (N, latent_dim, ENCODED_PATCH_INDEXES, ENCODED_PATCH_INDEXES)
         out = self.residual(out)
         out = out.reshape(out.shape[0], -1)
         return ModelOutput(embedding=out)
 
 
 class CustomDecoderConv(BaseDecoder):
-    """Port of `DecoderConv`, unflattening the 2D quantized vector from pythae's VQVAE."""
+    """Port of `DecoderConv`, unflattening the 2D quantized vector from pythae's VQVAE.
+
+    Outputs raw logits (no final sigmoid) -- reconstruction loss is computed
+    with `F.binary_cross_entropy_with_logits` (see `CustomVQVAE._get_vae_loss`
+    below). Apply `torch.sigmoid()` to `recon_x` yourself wherever you need an
+    actual [0, 1] reconstruction (e.g. `reconstruct()` below).
+    """
 
     def __init__(self, model_config: CustomVQVAEConfig) -> None:
         BaseDecoder.__init__(self)
@@ -119,7 +136,7 @@ class CustomDecoderConv(BaseDecoder):
 
         self.latent_dim = latent_dim
         self.encoded_patch_indexes = ENCODED_PATCH_INDEXES
-        self.segment_size = model_config.input_dim[-1]
+        self.patch_size = model_config.input_dim[-1]
 
         self.residual = nn.Sequential(
             ResBlock2d(latent_dim, latent_dim // 2),
@@ -136,16 +153,54 @@ class CustomDecoderConv(BaseDecoder):
         )
 
     def forward(self, z: torch.Tensor) -> ModelOutput:
-        out = z.reshape(z.shape[0], self.latent_dim, self.encoded_patch_indexes)
+        out = z.reshape(
+            z.shape[0], self.latent_dim, self.encoded_patch_indexes, self.encoded_patch_indexes
+        )
         out = self.residual(out)
-        out = self.model(out)               # length 8 for the default kernel/stride
-        # The transposed convs always produce length 8, so resize to the real
-        # segment size (no-op when segment_size == 8).
-        if out.shape[-1] != self.segment_size:
-            out = F.interpolate(out, size=self.segment_size, mode="linear",
-                                align_corners=False)
-        out = torch.sigmoid(out)            # reconstruction in [0, 1]
+        out = self.model(out)               # (N, channels, H_out, W_out)
+        # Resize to the real patch size (no-op when it already matches).
+        if out.shape[-2:] != (self.patch_size, self.patch_size):
+            out = F.interpolate(
+                out, size=(self.patch_size, self.patch_size), mode="bilinear",
+                align_corners=False,
+            )
+        # NOTE: raw logits returned here -- no sigmoid. See class docstring.
         return ModelOutput(reconstruction=out)
+
+
+class CustomVQVAE(VQVAE):
+    """pythae's VQVAE with its default MSE reconstruction loss swapped for
+    BCE-with-logits. Everything else (encoder, quantizer selection via
+    `_set_quantizer`, `forward`) is untouched -- only `loss_function` is
+    overridden.
+    """
+
+    def _get_vae_loss(
+        self,
+        recon_x: torch.Tensor,
+        x: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        VAE binary cross entropy loss
+        """
+        recon_loss = F.binary_cross_entropy_with_logits(
+            recon_x,
+            x,
+            reduction="mean"
+        )
+
+        return recon_loss
+
+    def loss_function(self, recon_x, x, quantizer_output):
+        recon_loss = self._get_vae_loss(recon_x, x)
+
+        vq_loss = quantizer_output.loss
+
+        return (
+            recon_loss + vq_loss.mean(dim=0),
+            recon_loss,
+            vq_loss.mean(dim=0),
+        )
 
 
 class AddNormalization:
@@ -161,12 +216,21 @@ class AddNormalization:
 
 class PixelsDataset(Dataset):
     """
-    Pytorch dataset class for making PixelEventHit adcs into tensors
+    Pytorch dataset class for making PixelEventHit adcs into tensors.
+
+    NOTE (fixes vs. the version you pasted):
+    - `__getitem__` now returns a `DatasetOutput(data=...)` (pythae's own
+      `OrderedDict`-with-attribute-access type), not a bare Tensor/ndarray --
+      pythae's `TrainingPipeline` requires this once you hand it your own
+      `Dataset` subclass (see `pythae/data/datasets.py`'s own `BaseDataset`).
+    - Each patch now gets an explicit channel dimension
+      (`(1, patch_size, patch_size)`), since Conv2d expects `(N, C, H, W)`.
 
     Returns:
-        torch.Tensor: adcs patches as tensors
+        DatasetOutput: dict-like object with a 'data' key holding the patch
+        as a torch.Tensor of shape (1, patch_size, patch_size)
     """
-    
+
     def __init__(self, patches: np.ndarray, patch_size: int, transform=None):
         self.event_patches_adcs = [
             patch.reshape(patch_size, patch_size)
@@ -177,14 +241,17 @@ class PixelsDataset(Dataset):
     def __len__(self) -> int:
         return len(self.event_patches_adcs)
 
-    def __getitem__(self, index: int) -> np.ndarray | torch.Tensor:
+    def __getitem__(self, index: int) -> DatasetOutput:
         event_patch = self.event_patches_adcs[index]
-        
+
+        # uint16 -> int32: older torch versions cannot convert uint16 arrays
+        event_patch = torch.as_tensor(event_patch.astype(np.int32)).unsqueeze(0)
+
         # Applying the transform
         if self.transform:
             event_patch = self.transform(event_patch)
-        
-        return event_patch
+
+        return DatasetOutput(data=event_patch)
 
 
 class Helper:
@@ -220,33 +287,39 @@ def reconstruct(model, data: torch.Tensor, device, batch_size: int = 256) -> tor
     for start in range(0, data.shape[0], batch_size):
         batch = data[start:start + batch_size].to(device)
         out = model({"data": batch})
-        outputs.append(out.recon_x.cpu())
+        recon = torch.sigmoid(out.recon_x)  # logits -> [0, 1] reconstruction
+        outputs.append(recon.cpu())
     return torch.cat(outputs, dim=0)
 
 
 def rmse(original: torch.Tensor, reconstructed: torch.Tensor) -> float:
-    """Mean over samples of the per-sample root-mean-square error."""
-    diff = (original - reconstructed).reshape(original.shape[0], -1)
-    per_sample_mse = torch.mean(diff ** 2, dim=1)
-    return torch.sqrt(per_sample_mse).mean().item()
+    """Mean over samples of the per-sample RMSE, in ADC counts."""
+    original = np.round((original * ADC_MAX).cpu().numpy())
+    reconstructed = np.round((reconstructed * ADC_MAX).cpu().numpy())
+
+    per_sample_rmse = mean_squared_error(
+        original,
+        reconstructed
+    )
+    return float(per_sample_rmse**0.5)
 
 
 def dataset_to_tensor(dataset: Dataset) -> torch.Tensor:
-    return torch.stack([dataset[i]["data"] for i in range(len(dataset))])  # (N, 1, L)
+    return torch.stack([dataset[i]["data"] for i in range(len(dataset))])  # (N, 1, H, W)
 
 
 def plot_rmse(rmse_values: dict, bit_depths: list[int], out_path: str) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    for segment, values in sorted(rmse_values.items()):
-        ax.plot(bit_depths, values, marker="o", label=f"Segment size {segment}")
+    for pixel_size, values in sorted(rmse_values.items()):
+        ax.plot(bit_depths, values, marker="o", label=f"Pixel patch size {pixel_size}")
     ax.set_xlabel("Bit depth")
-    ax.set_ylabel("RMSE (normalized units)")
-    ax.set_title("VQ-VAE RMSE by segment size")
+    ax.set_ylabel("RMSE (ADC)")
+    ax.set_title("VQ-VAE RMSE by pixel patch size")
     ax.set_xticks(bit_depths)
     ax.legend()
     ax.grid(alpha=0.3)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.show()
+    plt.close(fig)
 
 
 def main() -> None:
@@ -258,33 +331,41 @@ def main() -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    print("Loading strip data")
-    pixel_modules = PixelModule.read_json('/data/cern/pileup_ml/detid_info/detids_bpix.json', '/data/cern/pileup_ml/detid_info/detids_fpix.json')
+    print("Loading pixel data")
+    pixel_modules = PixelModule.read_json(
+        '/data/cern/pileup_ml/detid_info/detids_bpix.json',
+        '/data/cern/pileup_ml/detid_info/detids_fpix.json',
+    )
     pixel_detector = PixelDetector(pixel_modules)
-    
+
+    # NOTE (fix): keep the raw event lists around unchanged across iterations.
+    # The version you pasted reassigned `pixels_events_train`/`_test` with the
+    # *patch arrays* returned by `get_patches_sets` inside the loop, so on the
+    # second `pixel_size` the "events" being patchified were actually already
+    # the previous iteration's patches, not the original digi events.
     pixels_events_train = PixelDigiEvent.read_root(
         "/data/cern/pileup_ml/premixlib2024/0001.root", detector=pixel_detector
     )[:EVENT_COUNT_TRAIN]
     pixels_events_test = PixelDigiEvent.read_root(
-       "/data/cern/pileup_ml/premixlib2024/0002.root", detector=pixel_detector
+        "/data/cern/pileup_ml/premixlib2024/0002.root", detector=pixel_detector
     )[:EVENT_COUNT_TEST]
 
     data_transform = transforms.Compose([AddNormalization()])
     rmse_values = defaultdict(list)
 
     for pixel_size in PIXEL_SIZES:
-        pixels_events_train, pixels_events_test = Helper.get_strips_sets(
+        pixel_patches_train, pixel_patches_test = Helper.get_patches_sets(
             pixels_events_train, pixels_events_test, pixel_size
         )
-        # Rebuild the data for every segment size
-        print(f"Preparing train and test data for segment size {pixel_size}")
-        vqvae_trainset = PixelsDataset(pixels_events_train, pixel_size, data_transform)
-        vqvae_testset = PixelsDataset(pixels_events_test, pixel_size, data_transform)
+        # Rebuild the data for every patch size
+        print(f"Preparing train and test data for pixel patch size {pixel_size}")
+        vqvae_trainset = PixelsDataset(pixel_patches_train, pixel_size, data_transform)
+        vqvae_testset = PixelsDataset(pixel_patches_test, pixel_size, data_transform)
         test_data = dataset_to_tensor(vqvae_testset)
 
         for bit_depth in BIT_DEPTHS:
             start_time = datetime.now()
-            print(f"Starting VQ-VAE strips at {start_time:%Y-%m-%d %H:%M:%S}")
+            print(f"Starting VQ-VAE pixels at {start_time:%Y-%m-%d %H:%M:%S}")
 
             num_embeddings = codebook_size(bit_depth)
             print(f"Applying: num_embeddings = {num_embeddings} "
@@ -295,7 +376,7 @@ def main() -> None:
             np.random.seed(SEED)
 
             model_config = CustomVQVAEConfig(
-                input_dim=(CHANNELS, pixel_size),
+                input_dim=(CHANNELS, pixel_size, pixel_size),
                 latent_dim=32,
                 hidden_channels=16,
                 num_embeddings=num_embeddings,
@@ -306,7 +387,9 @@ def main() -> None:
             encoder = CustomEncoderConv(model_config)
             decoder = CustomDecoderConv(model_config)
 
-            model = VQVAE(
+            # CustomVQVAE = pythae's VQVAE + BCE-with-logits reconstruction loss
+            # (instead of the default MSE).
+            model = CustomVQVAE(
                 model_config=model_config,
                 encoder=encoder,
                 decoder=decoder,
@@ -334,21 +417,17 @@ def main() -> None:
             overall_rmse = rmse(test_data, reconstructions)
             rmse_values[pixel_size].append(overall_rmse)
 
-            print(f"RMSE (eval set): {overall_rmse:.6f} normalized "
-                  f"({overall_rmse * ADC_MAX:.2f} ADC)")
+            print(f"RMSE (eval set): {overall_rmse:.2f} ADC")
 
             elapsed = (datetime.now() - start_time).total_seconds()
             print(f"Finished at {datetime.now():%Y-%m-%d %H:%M:%S}")
             print(f"Time difference = {elapsed:.0f} seconds\n------------------")
 
-            print("Plotting overall patch based on different bit depth pixel VQ-VAE model rmse")
-        
-        plot_rmse(
-            rmse_values,
-            BIT_DEPTHS,
-            "vqvae_pixels_reconstruction_rmse_vs_bit_depth.png",
-        )
-        print("DONE")
+    # Plot once, after all pixel sizes and bit depths have finished
+    print("Plotting overall patch based on different bit depth pixel VQ-VAE model rmse")
+    plot_rmse(rmse_values, BIT_DEPTHS, PLOT_PATH)
+    print(f"Saved plot to {PLOT_PATH}")
+    print("DONE")
 
 
 if __name__ == "__main__":
