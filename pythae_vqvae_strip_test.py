@@ -1,5 +1,4 @@
 import os
-import re
 
 from collections import defaultdict
 from dataclasses import replace
@@ -45,21 +44,12 @@ CHANNELS = 1
 EVENT_COUNT_TRAIN = 3
 EVENT_COUNT_TEST = 80
 ADC_MAX = 1023
-MIN_ADC = 0
-MAX_ADC = ADC_MAX  # alias -- `load_scenario_metrics` below reads these two names
 SEED = 123
 OUTPUT_DIR = "my_custom_vqvae_model"
-
-# Root folder that holds one subfolder per (segment_size, bit_depth) scenario,
-# each with its own `metrics.csv` (one row per test event). Folder names must
-# match the `bs=<segment_size>__bd=<bit_depth>` pattern `parse_scenario_name`
-# expects.
-METRICS_ROOT = "vqvae_strips_metrics"
 
 PLOT_PATH = "vqvae_strips_rmse_adc_vs_bit_depth_by_segment_size.png"
 PRECISION_PLOT_PATH = "vqvae_strips_precision_vs_bit_depth_by_segment_size.png"
 RECALL_PLOT_PATH = "vqvae_strips_recall_vs_bit_depth_by_segment_size.png"
-NRMSE_PLOT_PATH = "vqvae_strips_nrmse_vs_bit_depth_by_segment_size.png"
 PERPLEXITY_PLOT_PATH = "vqvae_strips_perplexity_vs_bit_depth_by_segment_size.png"
 
 KERNEL_SIZE = 4
@@ -391,8 +381,8 @@ def evaluate_events(
     model, events: list[StripDigiEvent], segment_size: int, device, bit_depth: int
 ) -> pd.DataFrame:
     """Round-trip every test event and return one row per event with its own
-    rmse/precision/recall (pileup_ml metrics), so `load_scenario_metrics` can
-    later average them per scenario the same way it does for the pixels side.
+    rmse/precision/recall (pileup_ml metrics); `main()` averages these per
+    scenario before plotting.
     """
     reconstructed = [reconstruct_event(model, e, segment_size, device) for e in events]
 
@@ -442,34 +432,6 @@ def plot_metric(df: pd.DataFrame, metric: str, x_param: str = "segment_size", ax
     return ax
 
 
-def parse_scenario_name(name: str) -> dict:
-    """Parse patch size and bit depth from a scenario folder name like 'pixel_bs=4__bd=8'."""
-    bs_match = re.search(r"bs=(\d+)", name)
-    bd_match = re.search(r"bd=(\d+)", name)
-    if not bs_match or not bd_match:
-        raise ValueError(f"Could not parse bs/bd from scenario name: {name}")
-    return {"segment_size": int(bs_match.group(1)), "bit_depth": int(bd_match.group(1))}
-
-
-def load_scenario_metrics(scenario_root) -> pd.DataFrame:
-    """Read metrics.csv from each scenario subfolder and return one row per scenario
-    with mean metrics plus the parsed patch_size/bit_depth columns."""
-    scenario_root = Path(scenario_root)
-    rows = []
-    for scenario_dir in sorted(scenario_root.iterdir()):
-        if not scenario_dir.is_dir():
-            continue
-        metrics_path = scenario_dir / "metrics.csv"
-        if not metrics_path.exists():
-            continue
-        params = parse_scenario_name(scenario_dir.name)
-        metrics_df = pd.read_csv(metrics_path)
-        metrics_df['nrmse'] = metrics_df['rmse'] / (MAX_ADC - MIN_ADC)
-        means = metrics_df.drop(columns=["event_id"], errors="ignore").mean(numeric_only=True)
-        rows.append({"scenario": scenario_dir.name, **params, **means.to_dict()})
-    return pd.DataFrame(rows)
-
-
 def plot_metric_legacy(
     values: dict, bit_depths: list[int], ylabel: str, title: str, out_path: str
 ) -> None:
@@ -511,8 +473,7 @@ def main() -> None:
 
     data_transform = transforms.Compose([AddNormalization()])
     perplexity_values = defaultdict(list)
-
-    Path(METRICS_ROOT).mkdir(parents=True, exist_ok=True)
+    summary_rows = []
 
     display_module_strip_hits(strip_events_test[0])
     print("INFO: Saved initial test set event for debug")
@@ -591,10 +552,15 @@ def main() -> None:
             # and AutoModel dropping the custom `hidden_channels` config field).
             metrics_df = evaluate_events(model, strip_events_test, segment, device, bit_depth)
 
-            scenario_name = f"bs={segment}__bd={bit_depth}"
-            scenario_dir = Path(METRICS_ROOT) / scenario_name
-            scenario_dir.mkdir(parents=True, exist_ok=True)
-            metrics_df.to_csv(scenario_dir / "metrics.csv", index=False)
+            summary_rows.append(
+                {
+                    "segment_size": segment,
+                    "bit_depth": bit_depth,
+                    "rmse": metrics_df["rmse"].mean(),
+                    "precision": metrics_df["precision"].mean(),
+                    "recall": metrics_df["recall"].mean(),
+                }
+            )
 
             print(
                 f"RMSE (matching hits): {metrics_df['rmse'].mean():.2f} ADC | "
@@ -609,11 +575,10 @@ def main() -> None:
     # Plot once, after all segment sizes and bit depths have finished
     print("Plotting metrics")
 
-    summary_df = load_scenario_metrics(METRICS_ROOT)
+    summary_df = pd.DataFrame(summary_rows)
 
     for metric, out_path, title in (
         ("rmse", PLOT_PATH, "VQ-VAE RMSE (ADC) by segment size"),
-        ("nrmse", NRMSE_PLOT_PATH, "VQ-VAE normalized RMSE by segment size"),
         ("precision", PRECISION_PLOT_PATH, "VQ-VAE hit precision by segment size"),
         ("recall", RECALL_PLOT_PATH, "VQ-VAE hit recall by segment size"),
     ):
@@ -631,10 +596,9 @@ def main() -> None:
     )
 
     print(
-        f"Saved plots to {PLOT_PATH}, {NRMSE_PLOT_PATH}, {PRECISION_PLOT_PATH}, "
+        f"Saved plots to {PLOT_PATH}, {PRECISION_PLOT_PATH}, "
         f"{RECALL_PLOT_PATH}, {PERPLEXITY_PLOT_PATH}"
     )
-    print(f"Per-scenario metrics.csv files under {METRICS_ROOT}/")
     print("DONE")
 
 
